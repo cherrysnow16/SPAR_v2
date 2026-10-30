@@ -48,7 +48,9 @@ STEP_RULES = """Step assignment rules:
 _INT_OR_NULL = {"anyOf": [{"type": "integer"}, {"type": "null"}]}
 SCHEMAS = {
     "self": {"type": "object", "properties": {
-        "reasoning": {"type": "string"},
+        # cap so a looping reasoning field is closed by the grammar instead of truncated at max_tokens
+        # (normal reasoning: median ~240, p99 ~590 chars)
+        "reasoning": {"type": "string", "maxLength": 1000},
         "subgoals": {"type": "array", "maxItems": 5, "items": {"type": "object", "properties": {
             "subgoal": {"type": "string"}, "step": _INT_OR_NULL}, "required": ["subgoal", "step"]}}},
         "required": ["reasoning", "subgoals"]},
@@ -75,10 +77,21 @@ _JSON_EXAMPLES = {
 }
 
 
-def _output_section(kind: str, fmt: str, text_section: str) -> str:
+# per-environment navigation rule and self-schema example; ALFWorld is the default wording above
+_NAV_RULES = {
+    "alfworld": '- Ignore low-level navigation actions (e.g. "go to", "look", "open", "inventory").',
+    "webshop": '- Ignore page navigation actions (e.g. "next >", "< prev", "back to search", "description", "features", "reviews").',
+}
+_SELF_EXAMPLES = {
+    "alfworld": _JSON_EXAMPLES["self"],
+    "webshop": '{"subgoals": [{"subgoal": "search for the product", "step": 0}, {"subgoal": "select the size", "step": null}]}',
+}
+
+
+def _output_section(kind: str, fmt: str, text_section: str, example: str | None = None) -> str:
     if fmt == "text":
         return text_section
-    example = _JSON_EXAMPLES[kind]
+    example = example or _JSON_EXAMPLES[kind]
     if fmt == "json":
         return ("First, reason step-by-step within <think> </think> tags.\n"
                 "Then output ONLY a JSON object inside <json> </json> tags, shaped like this example:\n"
@@ -98,15 +111,16 @@ def _attempts_block(trajs_actions, wons) -> str:
     return "\n\n".join(blocks)
 
 
-def self_prompt(task, actions, won, fmt):
+def self_prompt(task, actions, won, fmt, env="alfworld"):
     if fmt == "text":
         return format_subgoal_prompt(task, actions, won=won)  # current SPAR default prompt
+    rules = SUBGOAL_RULES.replace(_NAV_RULES["alfworld"], _NAV_RULES[env])
     outcome = "SUCCESSFULLY completed" if won else "FAILED to complete"
     return (f"You are analyzing a trajectory of a goal-directed task.\n\nYour task is: {task}\n\n"
             f"Below is the full trajectory:\n{_format_trajectory_actions(actions)}\n\nThis trajectory {outcome} the task.\n\n"
             "Your job is to:\n(1) propose a minimal ordered list of high-level subgoals that decompose the task, AND\n"
             "(2) identify the step at which each proposed subgoal is first achieved in THIS trajectory.\n\n"
-            f"{SUBGOAL_RULES}\n\n{STEP_RULES.format(none='null')}\n\n" + _output_section("self", fmt, ""))
+            f"{rules}\n\n{STEP_RULES.format(none='null')}\n\n" + _output_section("self", fmt, "", _SELF_EXAMPLES[env]))
 
 
 def common1_prompt(task, trajs_actions, wons, fmt):

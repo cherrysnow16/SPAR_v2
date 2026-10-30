@@ -75,6 +75,9 @@ class TaskRunner:
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
+        # text-only run of a model that ships a multimodal processor (e.g. Qwen3.5): keep the plain tokenizer path
+        if config.actor_rollout_ref.model.get("text_only", False):
+            processor = None
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:

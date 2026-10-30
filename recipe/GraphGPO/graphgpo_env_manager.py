@@ -773,12 +773,18 @@ def make_envs(config):
                     'max_ads': getattr(config.env.webshop, 'max_ads', 1),
                     }
         projection_f = partial(webshop_projection)
+        # env.webshop.envs_per_actor > 1: host several envs per Ray actor (same semantics; fewer processes/threads)
+        envs_per_actor = OmegaConf.select(config, 'env.webshop.envs_per_actor', default=1)
+        grouped_kwargs = {}
+        if envs_per_actor > 1:
+            from SPAR_v2.webshop_envs import WebshopGroupedEnv as build_webshop_envs
+            grouped_kwargs = {'envs_per_actor': envs_per_actor}
         if not config.trainer.test_only:
-            _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+            _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker, **grouped_kwargs)
             envs = WebshopEnvironmentManager(_envs, projection_f, config)
         else:
             envs=None
-        _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker, **grouped_kwargs)
         val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
         import time
         time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready

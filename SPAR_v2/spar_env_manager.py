@@ -7,6 +7,7 @@ from omegaconf import OmegaConf
 
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
+from agent_system.environments.env_manager import WebshopEnvironmentManager as _GiGPOWebshopEnvironmentManager
 from agent_system.memory import SimpleMemory
 
 
@@ -389,12 +390,119 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 break
 
 
+def _webshop_admissible(action: str, obs: str) -> bool:
+    """search[...] on the search page, or click[x] where x is a clickable of the page obs:
+    a [button] ... [button_] text (text_rich) or a [SEP] segment (text)."""
+    m = re.fullmatch(r"(search|click)\[(.+)\]", action.strip())
+    if not m:
+        return False
+    if "[button]" in obs or "[clicked button]" in obs:
+        clickables = {b.strip().lower() for b in re.findall(r"\[(?:clicked )?button\] (.+?) \[(?:clicked )?button_\]", obs)}
+    else:
+        clickables = {s.strip().strip("'").lower() for s in obs.split(" [SEP] ")}
+    return "search" in clickables if m.group(1) == "search" else m.group(2).strip() in clickables
+
+
+class WebshopEnvironmentManager(_GiGPOWebshopEnvironmentManager):
+    """GiGPO's WebShop manager (identical policy prompt, task extraction and success metrics)
+    plus what SPAR needs: graph node text and the state/action lists for subgoal annotation."""
+
+    END_STATE = "Episode finished."
+
+    def extract_task(self, text_obs: List[str]):
+        # text obs: "WebShop [SEP] Instruction: [SEP] <task> ..."; text_rich: "WebShop\nInstruction: \n<task>\n..."
+        # (same as recipe/GraphGPO; format_obs then keeps a text_rich obs as is, as in GraphGPO)
+        tasks = []
+        for obs in text_obs:
+            parts = obs.split(" [SEP] ") if '[SEP]' in obs else obs.split("\n")
+            assert parts[1].strip() == 'Instruction:'
+            tasks.append(parts[2])
+        return tasks
+
+    def reset(self, kwargs):
+        observations, infos = super().reset(kwargs)
+        observations['graph'] = list(observations['anchor'])
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        next_observations, rewards, dones, infos = super().step(text_actions)
+        next_observations['graph'] = list(next_observations['anchor'])
+        return next_observations, rewards, dones, infos
+
+    def state_preprocess(self, total_batch_list, tokenizer):
+        """-> per trajectory: states [{state, reward, active_masks}] (len = steps + 1) and projected actions."""
+        positions, responses = [], []
+        for i, traj in enumerate(total_batch_list):
+            for j in range(1, len(traj)):
+                positions.append((i, j - 1))
+                responses.append(traj[j - 1]['responses'])
+                if not traj[j]['active_masks']:
+                    break
+        actions = self.projection_f(tokenizer.batch_decode(responses))[0] if responses else []
+        action_map = dict(zip(positions, actions))
+
+        raw_state_list, raw_action_list = [], []
+        for i, traj in enumerate(total_batch_list):
+            state_seq = [{"state": traj[0]['anchor_obs'], "reward": 0, "active_masks": traj[0]['active_masks']}]
+            action_seq = []
+            for j in range(1, len(traj)):
+                ended = not traj[j]['active_masks']
+                state_seq.append({"state": self.END_STATE if ended else traj[j]['anchor_obs'],
+                                  "reward": traj[j - 1]['rewards'],
+                                  "active_masks": traj[j - 1]['active_masks']})
+                action_seq.append(str(action_map[(i, j - 1)]))
+                if ended:
+                    break
+            raw_state_list.append(state_seq)
+            raw_action_list.append(action_seq)
+        return raw_state_list, raw_action_list
+
+    def clean_trajectory(self, trajectory, idx_to_state):
+        """Drop inadmissible actions (the page does not change). Admissible no-op clicks are kept:
+        selecting a product option leaves the text obs unchanged."""
+        return [[step for step in traj if _webshop_admissible(step[1], idx_to_state[step[0]])]
+                for traj in trajectory]
+
+
+def _make_webshop_envs(config, group_n, resources_per_worker):
+    """Same env settings and task sampling as GiGPO (agent_system.environments.env_manager.make_envs)."""
+    import time
+    import agent_system.environments.env_package.webshop as _webshop_pkg
+    from agent_system.environments.env_package.webshop import webshop_projection
+    from SPAR_v2.webshop_envs import WebshopGroupedEnv
+
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(_webshop_pkg.__file__)), 'webshop/data')
+    small = '_1000' if config.env.webshop.use_small else ''
+    env_kwargs = {
+        'observation_mode': OmegaConf.select(config, 'env.webshop.observation_mode', default='text'),
+        'num_products': None,
+        'human_goals': config.env.webshop.human_goals,
+        'file_path': os.path.join(data_dir, f'items_shuffle{small}.json'),
+        'attr_path': os.path.join(data_dir, f'items_ins_v2{small}.json'),
+    }
+    # several envs per Ray actor to stay under the container thread limit (SPAR_v2/webshop_envs.py)
+    envs_per_actor = OmegaConf.select(config, 'env.webshop.envs_per_actor', default=8)
+    _envs = WebshopGroupedEnv(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n,
+                              is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker,
+                              envs_per_actor=envs_per_actor)
+    _val_envs = WebshopGroupedEnv(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1,
+                                  is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker,
+                                  envs_per_actor=envs_per_actor)
+    projection_f = partial(webshop_projection)
+    envs = WebshopEnvironmentManager(_envs, projection_f, config)
+    val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
+    time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1)  # wait for the envs to be ready
+    return envs, val_envs
+
+
 def make_envs(config):
     if not isinstance(config.env.rollout.n, int):
         raise ValueError("config.env.rollout.n should be an integer")
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
     resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
 
+    if "webshop" in config.env.env_name.lower():
+        return _make_webshop_envs(config, group_n, resources_per_worker)
     if "alfworld" not in config.env.env_name.lower():
         raise ValueError(f"Unsupported environment: {config.env.env_name}")
 

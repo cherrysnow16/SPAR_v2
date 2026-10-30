@@ -115,7 +115,11 @@ class TrajectoryCollector:
             add_generation_prompt=True,
             tokenize=False
         )
-        
+        # Qwen3.5 templates pre-fill an empty think block; drop it so the policy writes <think>...</think><action>...</action> itself
+        empty_think = "<think>\n\n</think>\n\n"
+        if prompt_with_chat_template.endswith(empty_think):
+            prompt_with_chat_template = prompt_with_chat_template[:-len(empty_think)]
+
         # Initialize return dict
         row_dict = {}
         
